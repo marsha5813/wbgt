@@ -3,107 +3,111 @@ import geopandas as gpd
 import xarray as xr
 import numpy as np
 from shapely.geometry import box
+from typing import Union, Sequence
 
-def join_wbgt_to_geography(max_wbgt: xr.DataArray, geo_type: str = "county") -> gpd.GeoDataFrame:
+def join_wbgt_to_geography(
+    data: Union[xr.DataArray, xr.Dataset],
+    geo_type: str = "county",
+    var_names: Sequence[str] = None
+) -> gpd.GeoDataFrame:
     """
-    Spatially joins gridded WBGT values (max_wbgt) to local Census regions
-    (counties or tracts) that are stored as shapefiles in the /data directory
-    one level above the functions directory.
-    
-    The function converts grid cells to polygons, calculates the fraction of each
-    cell that intersects with a Census region, and computes a weighted average
-    WBGT for the region.
+    Spatially join gridded variables (e.g. WBGT, MRT, T2m) to Census regions.
 
     Parameters:
-      max_wbgt: xarray.DataArray
-          A DataArray containing gridded wet bulb globe temperatures.
-          It must have 'latitude' and 'longitude' coordinates (cell centers).
-      geo_type: str
-          Either "county" or "tract". Other options are not supported.
+      data : xr.DataArray or xr.Dataset
+        If DataArray, must have dims 'latitude' and 'longitude' and name (will
+        default to 'wbgt' if name is None).  If Dataset, must contain one or more
+        data_vars with dims ('latitude','longitude') plus optionally extra dims
+        like 'valid_time'.
+      geo_type : str
+        'county' or 'tract'.
+      var_names : sequence of str, optional
+        Which data_vars in the Dataset to process.  If None and `data` is a
+        Dataset, all data_vars will be used.  Ignored if `data` is a DataArray.
 
     Returns:
-      result_gdf: geopandas.GeoDataFrame
-          A GeoDataFrame with one row per region (county or tract), including the
-          weighted WBGT value, the region identifier (GEOID if available), and geometry.
+      GeoDataFrame with columns:
+        region_id, <each var_name>, geometry
     """
-    
-    # Compute the base directory: go up one level from the current file's directory
+    # load the shapefile
     base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-    
-    # Determine the shapefile path based on the geography type.
     if geo_type == "county":
-        shp_path = os.path.join(base_dir, "cb_2023_us_county_5m", "cb_2023_us_county_5m.shp")
+        shp = "cb_2023_us_county_5m/cb_2023_us_county_5m.shp"
     elif geo_type == "tract":
-        shp_path = os.path.join(base_dir, "cb_2023_us_tract_5m", "cb_2023_us_tract_5m.shp")
+        shp = "cb_2023_us_tract_5m/cb_2023_us_tract_5m.shp"
     else:
-        raise ValueError("Invalid geography type. Choose 'tract' or 'county'.")
+        raise ValueError("geo_type must be 'county' or 'tract'")
+    regions = gpd.read_file(os.path.join(base_dir, shp)).to_crs("EPSG:4326")
 
-    # Read the shapefile into a GeoDataFrame.
-    regions_gdf = gpd.read_file(shp_path)
-    
-    # Convert CRS to EPSG:4326 if needed.
-    if regions_gdf.crs is None or regions_gdf.crs.to_string() != "EPSG:4326":
-        regions_gdf = regions_gdf.to_crs("EPSG:4326")
-    
-    # --------------------------------------------------------
-    # Convert grid cells from max_wbgt to polygons.
-    # Assumes the xarray DataArray has 1D 'lat' and 'lon' coordinates representing cell centers.
-    # --------------------------------------------------------
-    lats = max_wbgt['latitude'].values
-    lons = max_wbgt['longitude'].values
-
-    # Estimate grid resolution (assuming uniform spacing).
-    if len(lats) > 1:
-        dlat = np.abs(lats[1] - lats[0])
+    # normalize input into a Dataset + select vars
+    if isinstance(data, xr.DataArray):
+        name = data.name or "wbgt"
+        ds = data.to_dataset(name=name)
+        vars_to_do = [name]
+    elif isinstance(data, xr.Dataset):
+        ds = data
+        vars_to_do = list(ds.data_vars) if var_names is None else list(var_names)
+        missing = set(vars_to_do) - set(ds.data_vars)
+        if missing:
+            raise KeyError(f"Dataset does not contain variables: {missing}")
     else:
-        raise ValueError("Latitude coordinate must have more than one value to determine cell size.")
-    
-    if len(lons) > 1:
-        dlon = np.abs(lons[1] - lons[0])
-    else:
-        raise ValueError("Longitude coordinate must have more than one value to determine cell size.")
+        raise TypeError("`data` must be an xarray DataArray or Dataset")
 
-    grid_polys = []
-    wbgt_values = []
-    # Create a polygon for each grid cell.
-    for i, lat in enumerate(lats):
-        for j, lon in enumerate(lons):
-            cell_poly = box(lon - dlon/2, lat - dlat/2, lon + dlon/2, lat + dlat/2)
-            grid_polys.append(cell_poly)
-            wbgt_values.append(max_wbgt.values[i, j])
-    
-    grid_gdf = gpd.GeoDataFrame({"wbgt": wbgt_values, "geometry": grid_polys}, crs="EPSG:4326")
-    
-    # --------------------------------------------------------
-    # Proportional allocation: For each region, compute a weighted average WBGT.
-    # For each grid cell overlapping a region, use the fraction of its area inside the region as a weight.
-    # --------------------------------------------------------
+    # extract grid cell centers
+    lats = ds["latitude"].values
+    lons = ds["longitude"].values
+    if len(lats) < 2 or len(lons) < 2:
+        raise ValueError("Need at least two latitudes and longitudes to infer cell size")
+    dlat = abs(lats[1] - lats[0])
+    dlon = abs(lons[1] - lons[0])
+
+    # build cell polygons
+    polys = [
+        box(lon - dlon/2, lat - dlat/2, lon + dlon/2, lat + dlat/2)
+        for lat in lats for lon in lons
+    ]
+
+    # assemble a GeoDataFrame of the grid, collapsing extra dims by max()
+    grid_dict = {"geometry": polys}
+    for var in vars_to_do:
+        da = ds[var]
+        extra = [d for d in da.dims if d not in ("latitude", "longitude")]
+        if extra:
+            da = da.max(dim=extra)
+        grid_dict[var] = da.values.ravel()
+    grid = gpd.GeoDataFrame(grid_dict, crs="EPSG:4326")
+
+    # reproject to an equal‐area CRS for accurate area calculations
+    ea_crs = "EPSG:2163"  # US National Atlas Equal Area
+    regions_ea = regions.to_crs(ea_crs)
+    grid_ea    = grid.to_crs(ea_crs)
+
+    # loop over regions, compute weighted averages
     results = []
-    for idx, region in regions_gdf.iterrows():
-        region_geom = region.geometry
-        # Identify grid cells that intersect the region.
-        intersects_mask = grid_gdf.intersects(region_geom)
-        intersecting_cells = grid_gdf[intersects_mask].copy()
-        if intersecting_cells.empty:
+    for idx, region in regions_ea.iterrows():
+        mask  = grid_ea.intersects(region.geometry)
+        sub_ea = grid_ea[mask]
+        if sub_ea.empty:
             continue
 
-        total_weight = 0.0
-        weighted_sum = 0.0
-        for cell_idx, cell in intersecting_cells.iterrows():
-            intersection = cell.geometry.intersection(region_geom)
-            if not intersection.is_empty:
-                weight = intersection.area / cell.geometry.area
-                weighted_sum += cell.wbgt * weight
-                total_weight += weight
+        cell_area  = sub_ea.geometry.area
+        inter_area = sub_ea.geometry.intersection(region.geometry).area
+        weights    = inter_area / cell_area
 
-        region_wbgt = weighted_sum / total_weight if total_weight > 0 else np.nan
-        
-        region_id = region.get("GEOID", idx)
-        results.append({
-            "region_id": region_id,
-            "wbgt": region_wbgt,
-            "geometry": region_geom
-        })
-    
+        if weights.sum() == 0:
+            vals = {var: np.nan for var in vars_to_do}
+        else:
+            vals = {
+                var: (sub_ea[var] * weights).sum() / weights.sum()
+                for var in vars_to_do
+            }
+
+        # use the original geographic geometry for output
+        orig_geom = regions.loc[idx, "geometry"]
+        region_id = regions.loc[idx].get("GEOID", None)
+        row = {"region_id": region_id, **vals, "geometry": orig_geom}
+        results.append(row)
+
+    # build result GeoDataFrame in EPSG:4326
     result_gdf = gpd.GeoDataFrame(results, crs="EPSG:4326")
     return result_gdf

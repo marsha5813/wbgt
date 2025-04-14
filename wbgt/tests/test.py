@@ -1,3 +1,9 @@
+# This is a test script for the WBGT package, which computes the Wet Bulb Globe Temperature (WBGT) 
+# using weather data from the ERA5 reanalysis dataset and derived UTCI data. 
+# The script demonstrates how to download, process, and visualize the data using
+# various functions from the WBGT package. These helper functions are
+# not currently exposed in the package, but are useful for testing and development.
+
 # Environment
 import wbgt.functions.census as census
 import wbgt.functions.api as api

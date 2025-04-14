@@ -17,6 +17,7 @@ setup(
         "io",
         "os",
         "zipfile",
+        "typing",
         "tempfile",
         "shutil",
         "shapely",
